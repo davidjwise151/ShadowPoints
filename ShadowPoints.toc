@@ -1,0 +1,8 @@
+## Interface: 50400
+## Title: ShadowPoints
+## Notes: Clean combo point display.
+## Version: 1.2.0
+## Author: Custom
+## SavedVariables: ShadowPointsDB
+
+Core.lua
