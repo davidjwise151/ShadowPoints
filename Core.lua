@@ -10,7 +10,6 @@ local addonFrame = CreateFrame("Frame", ADDON_NAME .. "Frame", UIParent)
 --------------------------------------------------------------------------------
 local function CrispTexture(tex)
     if not tex then return end
-    -- Force bilinear/trilinear texture filtering to eliminate pixelated edges
     tex:SetHorizTile(false)
     tex:SetVertTile(false)
     if tex.SetFilterMode then
@@ -193,16 +192,6 @@ end
 --------------------------------------------------------------------------------
 local ComboPointBarMixin = {}
 
-local function GetCurrentPoints()
-    local points = GetComboPoints("player", "target") or 0
-    if points == 0 then
-        -- Native 5.4.8 fallback check for Enum.PowerType.ComboPoints or numeric 4
-        local comboEnum = (Enum and Enum.PowerType and Enum.PowerType.ComboPoints) or 4
-        points = UnitPower("player", comboEnum) or 0
-    end
-    return points
-end
-
 function ComboPointBarMixin:OnLoad()
     self:SetSize(126, 18)
     self:SetPoint("CENTER", UIParent, "CENTER", 0, -180)
@@ -218,18 +207,28 @@ function ComboPointBarMixin:OnLoad()
     self.BackGround:SetPoint("TOPLEFT")
     CrispTexture(self.BackGround)
 
+    self.maxPlayerComboPoints = 5
     self:InitilizeComboPoints()
+    self:LayoutComboPoints()
 
     self:SetScript("OnEvent", self.OnEvent)
     self:RegisterEvent("PLAYER_ENTERING_WORLD")
     self:RegisterEvent("PLAYER_TARGET_CHANGED")
-    self:RegisterEvent("UNIT_COMBO_POINTS")
-    self:RegisterEvent("UNIT_POWER_UPDATE")
-    self:RegisterEvent("UNIT_POWER_FREQUENT")
 
     if PLAYER_CLASS == "DRUID" then
         self:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
     end
+
+    -- Independent worker frame parented to UIParent so OnUpdate never halts when main bar hides
+    local pollFrame = CreateFrame("Frame", nil, UIParent)
+    local interval = 0
+    pollFrame:SetScript("OnUpdate", function(_, elapsed)
+        interval = interval + elapsed
+        if interval > 0.05 then
+            self:UpdateComboPoints()
+            interval = 0
+        end
+    end)
 end
 
 function ComboPointBarMixin:InitilizeComboPoints()
@@ -259,29 +258,38 @@ function ComboPointBarMixin:LayoutComboPoints()
 end
 
 function ComboPointBarMixin:UpdateComboPoints(forcePoints)
-    local currentPoints = forcePoints or GetCurrentPoints()
-    local maxPoints = self.maxPlayerComboPoints or 5
+    local currentPoints = forcePoints
 
-    -- Check if we should display the bar
-    local shouldShow = (currentPoints > 0 or self.isTesting) and (UnitExists("target") or self.isTesting)
+    if not currentPoints then
+        local targetPoints = GetComboPoints("player", "target") or 0
+        local powerPoints = UnitPower("player", 4) or 0
+        currentPoints = math.max(targetPoints, powerPoints)
+    end
+
+    local maxPoints = self.maxPlayerComboPoints or 5
+    local hasTarget = UnitExists("target") and not UnitIsDead("target")
+
+    local shouldShow = (currentPoints > 0 or self.isTesting) and (hasTarget or self.isTesting)
 
     if not shouldShow then
-        self:Hide()
-        -- Reset all points instantly when hiding
-        for i = 1, MAX_POINT_FRAMES do
-            local point = self.ComboPoints[i]
-            if point then
-                point.on = false
-                if point.AnimIn then point.AnimIn:Stop() end
-                if point.AnimOut then point.AnimOut:Stop() end
-                if point.Point then point.Point:SetAlpha(0) end
+        if self:IsShown() then
+            self:Hide()
+            for i = 1, MAX_POINT_FRAMES do
+                local point = self.ComboPoints[i]
+                if point then
+                    point.on = false
+                    if point.AnimIn then point.AnimIn:Stop() end
+                    if point.AnimOut then point.AnimOut:Stop() end
+                    if point.Point then point.Point:SetAlpha(0) end
+                end
             end
         end
         return
     end
 
-    -- Force parent frame visible first so animations trigger properly
-    self:Show()
+    if not self:IsShown() then
+        self:Show()
+    end
 
     -- Process active points
     for i = 1, math.min(currentPoints, maxPoints) do
@@ -312,26 +320,13 @@ function ComboPointBarMixin:UpdateComboPoints(forcePoints)
     end
 end
 
-function ComboPointBarMixin:OnEvent(event, unit, powerType)
-    if event == "PLAYER_TARGET_CHANGED" 
-       or event == "UNIT_COMBO_POINTS" 
-       or (event == "UNIT_POWER_UPDATE" and (powerType == "COMBO_POINTS" or unit == "player"))
-       or (event == "UNIT_POWER_FREQUENT" and (powerType == "COMBO_POINTS" or unit == "player")) then
-        self:UpdateComboPoints()
-    elseif event == "PLAYER_ENTERING_WORLD" then
-        if PLAYER_CLASS == "DRUID" then self:OnEvent("UNIT_DISPLAYPOWER") end
-        self.maxPlayerComboPoints = 5
-        self:LayoutComboPoints()
+function ComboPointBarMixin:OnEvent(event, ...)
+    if event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_TARGET_CHANGED" then
         self:UpdateComboPoints()
     elseif event == "UNIT_DISPLAYPOWER" then
         local pType = UnitPowerType("player")
-        local useComboPoints = (pType == 3) -- Energy (Cat Form)
-        if useComboPoints then
-            self:RegisterEvent("UNIT_COMBO_POINTS")
-            self:RegisterEvent("UNIT_POWER_UPDATE")
-        else
-            self:UnregisterEvent("UNIT_COMBO_POINTS")
-            self:UnregisterEvent("UNIT_POWER_UPDATE")
+        local useComboPoints = (pType == 3)
+        if not useComboPoints then
             self:Hide()
         end
     end
@@ -349,7 +344,6 @@ addonFrame:SetScript("OnEvent", function(self, event, tocName)
         Bar = Mixin(Bar, ComboPointBarMixin)
         Bar:OnLoad()
 
-        -- Slash command for test mode / positioning (/sp or /shadowpoints)
         SLASH_SHADOWPOINTS1 = "/sp"
         SLASH_SHADOWPOINTS2 = "/shadowpoints"
         SlashCmdList["SHADOWPOINTS"] = function()
