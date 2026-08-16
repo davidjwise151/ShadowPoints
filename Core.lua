@@ -1,6 +1,17 @@
 local ADDON_NAME = "ShadowPoints"
-local MAX_POINT_FRAMES = 6
 local PLAYER_CLASS = UnitClassBase("player")
+
+-- Bail out entirely for any class that doesn't use combo points. This runs
+-- before a single frame, texture, or function is created - for a Monk (or
+-- any non-Rogue/Druid), the whole file is just these few lines and then
+-- nothing. No CreateFrame, no RegisterEvent, no OnEvent handler ever
+-- exists. This re-evaluates fresh every login, so there's nothing to
+-- manually toggle when you swap characters - it's automatic.
+if PLAYER_CLASS ~= "ROGUE" and PLAYER_CLASS ~= "DRUID" then
+    return
+end
+
+local MAX_POINT_FRAMES = 6
 
 -- Create Root Addon Frame
 local addonFrame = CreateFrame("Frame", ADDON_NAME .. "Frame", UIParent)
@@ -10,20 +21,23 @@ local addonFrame = CreateFrame("Frame", ADDON_NAME .. "Frame", UIParent)
 --------------------------------------------------------------------------------
 -- UnitPower("player", COMBO_POINTS) returns the raw resource value, which in
 -- MoP does NOT reset when you switch targets (unless spent or Redirected) -
--- it just sits there until the client happens to get a UNIT_POWER_UPDATE.
--- That's what causes points to "stick" from a dead/previous target.
+-- it just sits there until the client actually changes it. Reading the raw
+-- value alone is what caused the original "stale points from a dead target"
+-- bug.
 --
--- GetComboPoints(unit, target) is the legacy target-aware API from this era:
--- it returns the point count ONLY if those points were built on the given
--- target, and 0 otherwise. That's the correct MoP-accurate behavior, so we
--- prefer it and only fall back to UnitPower if it's unavailable.
+-- The legacy target-aware GetComboPoints(unit, target) API looked like the
+-- fix, but it introduced a NEW bug: it correctly reports 0 right after a
+-- target switch, but lags by a tick on the first point you build on the new
+-- target, so the bar wouldn't reappear until something forced a re-read
+-- (deselect/reselect).
+--
+-- Instead we track validity ourselves: UNIT_POWER_UPDATE is a guaranteed-
+-- fresh push from the server, so whenever it fires we record which target
+-- the points belong to (comboTargetGUID). On a target switch we just
+-- compare that against the current target - no extra API call, no lag.
 local COMBO_POINTS_POWER_TYPE = (Enum and Enum.PowerType and Enum.PowerType.ComboPoints) or 4
-local HAS_TARGETED_COMBO_API = type(GetComboPoints) == "function"
 
-local function GetPlayerComboPoints()
-    if HAS_TARGETED_COMBO_API then
-        return GetComboPoints("player", "target") or 0
-    end
+local function GetRawComboPoints()
     return UnitPower("player", COMBO_POINTS_POWER_TYPE) or 0
 end
 
@@ -218,13 +232,15 @@ local ComboPointBarMixin = {}
 
 function ComboPointBarMixin:OnLoad()
     self:SetSize(126, 18)
-    self:SetPoint("CENTER", UIParent, "CENTER", 0, -180)
     self:SetMovable(true)
     self:EnableMouse(true)
     self:RegisterForDrag("LeftButton")
 
     self:SetScript("OnDragStart", function(s) if IsAltKeyDown() then s:StartMoving() end end)
-    self:SetScript("OnDragStop", function(s) s:StopMovingOrSizing() end)
+    self:SetScript("OnDragStop", function(s)
+        s:StopMovingOrSizing()
+        s:SavePosition()
+    end)
 
     self.BackGround = self:CreateTexture(nil, "BACKGROUND")
     self.BackGround:SetAtlas("ComboPoints-AllPointsBG", true)
@@ -233,20 +249,62 @@ function ComboPointBarMixin:OnLoad()
 
     self.maxPlayerComboPoints = 5
     self.lastTargetGUID = UnitGUID("target")
+    -- Best-effort assumption on load/reload: if we already have a target,
+    -- assume whatever raw combo point value exists belongs to it. Wrong at
+    -- most once, for a moment, on a fresh reload mid-combat.
+    self.comboTargetGUID = UnitGUID("target")
     self.currentDisplayed = 0
     self:InitilizeComboPoints()
     self:LayoutComboPoints()
+    self:ApplyPosition()
 
     self:SetScript("OnEvent", self.OnEvent)
     self:RegisterEvent("PLAYER_ENTERING_WORLD")
     self:RegisterEvent("PLAYER_TARGET_CHANGED")
     self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    self:RegisterEvent("PLAYER_DEAD")
+    self:RegisterEvent("PLAYER_ALIVE")
+    self:RegisterEvent("PLAYER_UNGHOST")
     self:RegisterUnitEvent("UNIT_HEALTH", "target")
     self:RegisterUnitEvent("UNIT_POWER_UPDATE", "player")
+    self:RegisterUnitEvent("UNIT_ENTERED_VEHICLE", "player")
+    self:RegisterUnitEvent("UNIT_EXITED_VEHICLE", "player")
 
     if PLAYER_CLASS == "DRUID" then
         self:RegisterUnitEvent("UNIT_DISPLAYPOWER", "player")
     end
+end
+
+-- Anchors the bar just under the Player Frame by default (so it reads as
+-- "built into" the default UI rather than a floating widget), unless the
+-- player has manually dragged it, in which case we restore their saved spot.
+function ComboPointBarMixin:ApplyPosition()
+    self:ClearAllPoints()
+    local pos = ShadowPointsDB and ShadowPointsDB.position
+    if pos then
+        self:SetPoint(pos.point or "CENTER", UIParent, pos.relPoint or "CENTER", pos.x or 0, pos.y or -180)
+    elseif PlayerFrame then
+        self:SetPoint("TOP", PlayerFrame, "BOTTOM", 6, -4)
+    else
+        self:SetPoint("CENTER", UIParent, "CENTER", 0, -180)
+    end
+end
+
+-- Called after a manual drag. Saves the bar's screen position (relative to
+-- UIParent, which is where a dragged frame ends up anchored) so it survives
+-- /reload and relogging instead of resetting to the default spot.
+function ComboPointBarMixin:SavePosition()
+    local point, _, relPoint, x, y = self:GetPoint(1)
+    ShadowPointsDB = ShadowPointsDB or {}
+    ShadowPointsDB.position = { point = point, relPoint = relPoint, x = x, y = y }
+end
+
+-- Clears any saved custom position and snaps back to the default
+-- Player-Frame-anchored spot.
+function ComboPointBarMixin:ResetPosition()
+    ShadowPointsDB = ShadowPointsDB or {}
+    ShadowPointsDB.position = nil
+    self:ApplyPosition()
 end
 
 function ComboPointBarMixin:InitilizeComboPoints()
@@ -288,8 +346,14 @@ function ComboPointBarMixin:UpdateComboPoints(forcePoints, skipAnim)
     if currentPoints == nil then
         if not hasTarget or isDead or not canAttack then
             currentPoints = 0
+        elseif UnitGUID("target") ~= self.comboTargetGUID then
+            -- The raw power value may still hold a leftover count from
+            -- whatever we were fighting before; it's only meaningful if it
+            -- was confirmed (via UNIT_POWER_UPDATE) to belong to this exact
+            -- target.
+            currentPoints = 0
         else
-            currentPoints = GetPlayerComboPoints()
+            currentPoints = GetRawComboPoints()
         end
     end
 
@@ -373,12 +437,13 @@ function ComboPointBarMixin:OnEvent(event, ...)
 
     if event == "PLAYER_ENTERING_WORLD" then
         self.lastTargetGUID = UnitGUID("target")
+        self.comboTargetGUID = UnitGUID("target")
         self:UpdateComboPoints(nil, true)
     elseif event == "PLAYER_TARGET_CHANGED" then
-        -- Snapshot the new target's GUID BEFORE resyncing, and resync
-        -- instantly (no animation) - this is the fix for points sticking
-        -- from a previous target: GetPlayerComboPoints() now correctly
-        -- reports 0 for a target you haven't built points on.
+        -- Snapshot the new target's GUID for death-matching. We deliberately
+        -- do NOT touch comboTargetGUID here - if it doesn't match the new
+        -- target, UpdateComboPoints will correctly display 0 until a real
+        -- UNIT_POWER_UPDATE confirms points on this target.
         self.lastTargetGUID = UnitGUID("target")
         self:UpdateComboPoints(nil, true)
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
@@ -387,20 +452,41 @@ function ComboPointBarMixin:OnEvent(event, ...)
         -- than re-reading UnitGUID("target") live: target can clear in the
         -- same instant the mob dies, which made the old check unreliable.
         if subevent == "UNIT_DIED" and destGUID == self.lastTargetGUID then
+            self.comboTargetGUID = nil
             self:UpdateComboPoints(0, true)
         end
     elseif event == "UNIT_HEALTH" and arg1 == "target" then
         if UnitIsDead("target") then
+            self.comboTargetGUID = nil
             self:UpdateComboPoints(0, true)
         end
+    elseif event == "PLAYER_DEAD" then
+        -- Player died: combo points are meaningless until we're back up.
+        self.comboTargetGUID = nil
+        self:UpdateComboPoints(0, true)
+    elseif event == "PLAYER_ALIVE" or event == "PLAYER_UNGHOST" then
+        -- Resurrected/reclaimed corpse: resync to whatever's true now.
+        self.comboTargetGUID = UnitGUID("target")
+        self:UpdateComboPoints(nil, true)
+    elseif event == "UNIT_ENTERED_VEHICLE" and arg1 == "player" then
+        self.comboTargetGUID = nil
+        self:UpdateComboPoints(0, true)
+    elseif event == "UNIT_EXITED_VEHICLE" and arg1 == "player" then
+        self.comboTargetGUID = nil
+        self:UpdateComboPoints(nil, true)
     elseif event == "UNIT_POWER_UPDATE" and arg2 == "COMBO_POINTS" then
+        -- Guaranteed-fresh push from the server: whatever we're targeting
+        -- right now is who these points belong to.
+        self.comboTargetGUID = UnitGUID("target")
         self:UpdateComboPoints()
     elseif event == "UNIT_DISPLAYPOWER" then
         local pType = UnitPowerType("player")
         local useComboPoints = (pType == COMBO_POINTS_POWER_TYPE)
         if not useComboPoints then
+            self.comboTargetGUID = nil
             self:Hide()
         else
+            self.comboTargetGUID = UnitGUID("target")
             self:UpdateComboPoints(nil, true)
         end
     end
@@ -411,26 +497,31 @@ end
 --------------------------------------------------------------------------------
 addonFrame:RegisterEvent("ADDON_LOADED")
 addonFrame:SetScript("OnEvent", function(self, event, tocName)
-    if tocName == ADDON_NAME then
-        if PLAYER_CLASS ~= "ROGUE" and PLAYER_CLASS ~= "DRUID" then return end
+    if tocName ~= ADDON_NAME then return end
 
-        local Bar = CreateFrame("Frame", ADDON_NAME .. "Bar", UIParent)
-        Bar = Mixin(Bar, ComboPointBarMixin)
-        Bar:OnLoad()
+    local Bar = CreateFrame("Frame", ADDON_NAME .. "Bar", UIParent)
+    Bar = Mixin(Bar, ComboPointBarMixin)
+    Bar:OnLoad()
 
-        SLASH_SHADOWPOINTS1 = "/sp"
-        SLASH_SHADOWPOINTS2 = "/shadowpoints"
-        SlashCmdList["SHADOWPOINTS"] = function()
-            if Bar.isTesting then
-                Bar.isTesting = false
-                Bar:UpdateComboPoints()
-                DEFAULT_CHAT_FRAME:AddMessage("|cff9966ff[ShadowPoints]|r Test mode disabled.")
-            else
-                Bar.isTesting = true
-                Bar:Show()
-                Bar:UpdateComboPoints(5)
-                DEFAULT_CHAT_FRAME:AddMessage("|cff9966ff[ShadowPoints]|r Test mode enabled. Hold ALT + Drag to move. Type /sp to close.")
-            end
+    SLASH_SHADOWPOINTS1 = "/sp"
+    SLASH_SHADOWPOINTS2 = "/shadowpoints"
+    SlashCmdList["SHADOWPOINTS"] = function(msg)
+        msg = (msg or ""):lower():trim()
+        if msg == "reset" then
+            Bar:ResetPosition()
+            DEFAULT_CHAT_FRAME:AddMessage("|cff9966ff[ShadowPoints]|r Position reset to default.")
+            return
+        end
+
+        if Bar.isTesting then
+            Bar.isTesting = false
+            Bar:UpdateComboPoints()
+            DEFAULT_CHAT_FRAME:AddMessage("|cff9966ff[ShadowPoints]|r Test mode disabled.")
+        else
+            Bar.isTesting = true
+            Bar:Show()
+            Bar:UpdateComboPoints(5)
+            DEFAULT_CHAT_FRAME:AddMessage("|cff9966ff[ShadowPoints]|r Test mode enabled. Hold ALT + Drag to move. Type /sp to close, /sp reset to restore default position.")
         end
     end
 end)

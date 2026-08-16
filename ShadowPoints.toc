@@ -1,7 +1,7 @@
 ## Interface: 50400
 ## Title: ShadowPoints
 ## Notes: Clean combo point display.
-## Version: 1.2.0
+## Version: 1.3.2
 ## Author: Custom
 ## SavedVariables: ShadowPointsDB
 
